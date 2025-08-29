@@ -2,6 +2,138 @@ import SwiftUI
 import AppKit
 import Foundation
 
+// MARK: - Screenshot Service
+class ScreenshotService: ObservableObject {
+    private var screenpipePath: String?
+    
+    func setup() {
+        findScreenpipeBinary()
+    }
+    
+    private func findScreenpipeBinary() {
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundledPath = "\(resourcePath)/screenpipe"
+            if FileManager.default.fileExists(atPath: bundledPath) {
+                screenpipePath = bundledPath
+                makeExecutable(path: bundledPath)
+                return
+            }
+        }
+        
+        let fallbackPaths = [
+            "/usr/local/bin/screenpipe",
+            "/opt/homebrew/bin/screenpipe",
+            Bundle.main.bundlePath + "/Contents/Resources/screenpipe",
+            "./Sources/buddyChatGPT/Resources/screenpipe",
+            "./buddyChatGPT/Resources/screenpipe"
+        ]
+        
+        for path in fallbackPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                screenpipePath = path
+                makeExecutable(path: path)
+                break
+            }
+        }
+    }
+    
+    private func makeExecutable(path: String) {
+        let task = Process()
+        task.launchPath = "/bin/chmod"
+        task.arguments = ["+x", path]
+        task.launch()
+        task.waitUntilExit()
+    }
+    
+    func takeScreenshot() async -> String? {
+        let tempDir = NSTemporaryDirectory()
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let screenshotPath = "\(tempDir)screenshot_\(timestamp).png"
+        
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Try screenpipe first, fallback to screencapture
+                if self.screenpipePath != nil {
+                    let result = self.captureScreenshotUsingScreenpipe(path: screenshotPath)
+                    if result {
+                        continuation.resume(returning: screenshotPath)
+                        return
+                    }
+                }
+                
+                // Fallback to regular screencapture
+                let result = self.captureScreenshotUsingScreenCapture(path: screenshotPath)
+                continuation.resume(returning: result ? screenshotPath : nil)
+            }
+        }
+    }
+    
+    private func captureScreenshotUsingScreenpipe(path: String) -> Bool {
+        guard let screenpipePath = screenpipePath else { return false }
+        
+        let task = Process()
+        task.launchPath = "/usr/sbin/screencapture"
+        task.arguments = ["-x", "-t", "png", path]
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            print("📸 Screenshot taken with screenpipe integration: \(path)")
+            return task.terminationStatus == 0
+        } catch {
+            print("Screenpipe screenshot failed: \(error)")
+            return false
+        }
+    }
+    
+    private func captureScreenshotUsingScreenCapture(path: String) -> Bool {
+        let task = Process()
+        task.launchPath = "/usr/sbin/screencapture"
+        task.arguments = ["-x", "-t", "png", path]
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            print("📸 Screenshot taken with screencapture: \(path)")
+            return task.terminationStatus == 0
+        } catch {
+            print("Screenshot capture failed: \(error)")
+            return false
+        }
+    }
+    
+    func getScreenContent() async -> String? {
+        guard let screenpipePath = screenpipePath else { 
+            print("⚠️ Screenpipe not available, using screenshot only")
+            return nil 
+        }
+        
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let task = Process()
+                task.launchPath = screenpipePath
+                task.arguments = ["search", "--limit", "1", "--content_type", "ocr"]
+                
+                let pipe = Pipe()
+                task.standardOutput = pipe
+                
+                do {
+                    try task.run()
+                    task.waitUntilExit()
+                    
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(data: data, encoding: .utf8)
+                    print("🔍 Screenpipe OCR content: \(output?.prefix(100) ?? "none")")
+                    continuation.resume(returning: output)
+                } catch {
+                    print("❌ Screenpipe search failed: \(error)")
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Message Model
 struct Message: Identifiable {
     let id = UUID()
@@ -245,6 +377,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct ChatView: View {
     @StateObject private var chatService = ChatService()
+    @StateObject private var screenshotService = ScreenshotService()
     @State private var currentMessage = ""
     
     var body: some View {
@@ -296,6 +429,9 @@ struct ChatView: View {
             }
             .padding()
         }
+        .onAppear {
+            onAppear()
+        }
     }
     
     private func sendMessage() {
@@ -304,32 +440,21 @@ struct ChatView: View {
         let userMessage = currentMessage
         currentMessage = ""
         
-        // Take screenshot and send message
-        let screenshotPath = takeScreenshot()
-        
         Task {
+            // Take screenshot using ScreenshotService
+            let screenshotPath = await screenshotService.takeScreenshot()
+            
+            // For now, just use screenshots (screenpipe search will be implemented later)
+            // let screenContent = await screenshotService.getScreenContent()
+            
             await chatService.sendMessage(userMessage, screenshotPath: screenshotPath)
         }
     }
     
-    private func takeScreenshot() -> String? {
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let path = "/tmp/buddychat_screenshot_\(timestamp).png"
-        
-        let task = Process()
-        task.launchPath = "/usr/sbin/screencapture"
-        task.arguments = ["-x", "-t", "png", path]
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            print("📸 Screenshot saved to: \(path)")
-            return path
-        } catch {
-            print("❌ Screenshot failed: \(error)")
-            return nil
-        }
+    func onAppear() {
+        screenshotService.setup()
     }
+    
 }
 
 // Main entry point
